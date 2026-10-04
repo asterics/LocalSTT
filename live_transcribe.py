@@ -623,6 +623,51 @@ def transcribe_parakeet_live(
 
 
 # ============================================================================
+# MP3 / Datei - Audio laden
+# ============================================================================
+
+def load_audio_16k(path):
+    """
+    Dekodiert beliebige Audioformate (mp3, m4a, flac, wav, ...)
+    nach 16 kHz / mono / float32 (Werte -1..1).
+
+    Warum: onnx-asr (Parakeet) kann Dateien nur als PCM-WAV lesen
+    ("file does not start with RIFF id" bei MP3), und faster-whisper
+    ruft av.open(..., metadata_errors=...) auf, was PyAV >= 19 nicht
+    mehr kennt. Mit eigener Dekodierung via PyAV funktionieren beide
+    Engines mit jedem PyAV-Stand.
+    """
+    import av
+
+    chunks = []
+
+    with av.open(path) as container:
+        stream = container.streams.audio[0]
+        resampler = av.AudioResampler(
+            format="s16",
+            layout="mono",
+            rate=SR,
+        )
+
+        for frame in container.decode(stream):
+            for f in resampler.resample(frame):
+                chunks.append(f.to_ndarray().reshape(-1))
+
+        # Reste aus dem Resampler herausspülen
+        for f in resampler.resample(None):
+            chunks.append(f.to_ndarray().reshape(-1))
+
+    if not chunks:
+        raise RuntimeError(
+            f"Keine Audiodaten in Datei gefunden: {path}"
+        )
+
+    return (
+        np.concatenate(chunks).astype(np.float32) / 32768.0
+    )
+
+
+# ============================================================================
 # MP3 / Datei - Whisper
 # ============================================================================
 
@@ -641,8 +686,12 @@ def transcribe_file_whisper(
 
     start_time = time.monotonic()
 
+    print("Dekodiere Audio ...")
+    audio = load_audio_16k(filename)
+    print(f"  Dauer: {duration_ts(len(audio) / SR)}\n")
+
     segments, info = model.transcribe(
-        filename,
+        audio,
 
         language=args.language,
 
@@ -758,8 +807,15 @@ def transcribe_file_parakeet(
         .with_vad(vad)
     )
 
+    # onnx-asr liest als Pfad nur PCM-WAV. Deshalb MP3 & Co.
+    # selbst dekodieren und das float32-Array übergeben.
+    print("Dekodiere Audio ...")
+    audio = load_audio_16k(filename)
+    print(f"  Dauer: {duration_ts(len(audio) / SR)}\n")
+
     results = vad_model.recognize(
-        filename
+        audio,
+        sample_rate=SR,
     )
 
     count = 0
