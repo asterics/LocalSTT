@@ -162,6 +162,10 @@ venv.bak/
 # Downloaded Models
 models/
 
+# Test mp3 files and transcribed text
+mp3/
+tests/
+
 
 # Spyder project settings
 .spyderproject
