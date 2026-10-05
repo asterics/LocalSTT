@@ -20,6 +20,8 @@ MODI
    In diesem Modus wird NICHT die Live-VAD verwendet.
    Whisper verwendet seine eingebaute VAD/Segmentierung.
    Parakeet verwendet onnx-asr mit Silero-VAD für lange Dateien.
+   Whistle (max. 30 s pro Aufruf) bekommt die Datei in Energie-VAD-
+   Abschnitten von höchstens 28 s.
    siehe auch: https://huggingface.co/spaces/nvidia/parakeet-tdt-0.6b-v3
 
 INSTALLATION
@@ -32,6 +34,10 @@ Live + Whisper:
 Zusätzlich für Parakeet:
 
     pip install "onnx-asr[cpu,hub]"
+
+Zusätzlich für Whistle (Cactus Needle/Whistle, 16.9 MB, CPU):
+
+    pip install cactus-needle
 
 BEISPIELE
 =========
@@ -47,6 +53,11 @@ Live, Whisper large-v3-turbo:
 Live, Parakeet:
 
     python live_transcribe.py --model parakeet
+
+Live, Whistle (winzig, sehr schnell; de/en/fr/es/it/nl/pl):
+
+    python live_transcribe.py --model whistle
+    python live_transcribe.py --model whistle --keywords "Kubernetes,Anthropic"
 
 MP3 mit Whisper:
 
@@ -87,6 +98,13 @@ WHISPER:
 
 PARAKEET:
     NVIDIA Parakeet-TDT 0.6B V3 über onnx-asr, CPU, INT8
+
+WHISTLE:
+    Cactus Whistle (Paket "cactus-needle"), 16.9 MB, CPU, max. 30 s je Aufruf.
+    Engine + whistle.cact werden beim ersten Start von Hugging Face geholt
+    und unter ~/.cache/cactus-needle abgelegt. Anonyme Nutzungs-Telemetrie
+    des Pakets wird von diesem Skript IMMER abgeschaltet
+    (NEEDLE_TELEMETRY=0, DO_NOT_TRACK=1).
 
 Parakeet V3 ist multilingual und unterstützt Deutsch.
 
@@ -131,6 +149,13 @@ import numpy as np
 SR = 16000
 FRAME_S = 0.03
 FRAME = int(SR * FRAME_S)
+
+
+# Sprachen, die Whistle unterstützt
+WHISTLE_LANGUAGES = ("en", "de", "fr", "es", "it", "nl", "pl")
+
+# Whistle verarbeitet höchstens 30 s je Aufruf -> mit Sicherheitsabstand
+WHISTLE_MAX_S = 28.0
 
 
 # Typische Whisper-Halluzinationen bei Stille/Rauschen
@@ -497,7 +522,11 @@ def load_model(args):
     engine:
         "whisper"
         "parakeet"
+        "whistle"
     """
+
+    if args.model.lower() == "whistle":
+        return load_whistle(args), "whistle"
 
     if args.model.lower() == "parakeet":
 
@@ -546,6 +575,103 @@ def load_model(args):
         )
 
         return model, "whisper"
+
+
+# ============================================================================
+# Whistle (Cactus Needle) - laden und transkribieren
+# ============================================================================
+
+def load_whistle(args):
+    """
+    Lädt Whistle über das Paket "cactus-needle".
+
+    Privacy: Das Paket sendet standardmäßig anonyme Nutzungszähler.
+    Das schalten wir VOR dem Import hart ab.
+    """
+
+    # Telemetrie des Pakets immer aus (Privacy-Anforderung).
+    os.environ["NEEDLE_TELEMETRY"] = "0"
+    os.environ["DO_NOT_TRACK"] = "1"
+
+    try:
+        import needle
+    except ImportError:
+        print(
+            "\nWhistle benötigt das Paket cactus-needle.\n"
+            "Installation:\n\n"
+            "  pip install cactus-needle\n"
+        )
+        raise
+
+    print(
+        "Lade Cactus Whistle (CPU) ...\n"
+        "  (erster Start: Engine + Gewichte werden einmalig "
+        "von Hugging Face geladen)"
+    )
+
+    # Warm-up: lädt Engine/Gewichte jetzt (nicht erst bei der ersten
+    # Äußerung) und lässt Fehler -- z.B. --offline ohne Cache -- sofort
+    # sichtbar werden. Stille liefert einen leeren Text.
+    needle.transcribe(np.zeros(SR, dtype=np.float32))
+
+    if args.language and args.language.lower() not in WHISTLE_LANGUAGES:
+        print(
+            f"Hinweis: Whistle unterstützt '{args.language}' nicht "
+            f"({', '.join(WHISTLE_LANGUAGES)}). "
+            "Sprache wird automatisch erkannt."
+        )
+
+    return needle
+
+
+def whistle_language(args):
+    lang = (args.language or "").lower()
+    return lang if lang in WHISTLE_LANGUAGES else None
+
+
+def whistle_keywords(args):
+    kw = getattr(args, "keywords", None)
+
+    if not kw:
+        return None
+
+    items = [k.strip() for k in kw.split(",") if k.strip()]
+
+    return items or None
+
+
+def transcribe_whistle_audio(model, audio, args):
+    """
+    Whistle verarbeitet höchstens 30 s je Aufruf. Längere Audiodaten
+    werden hier in <= 28-s-Stücke zerlegt (Live-Äußerungen sind
+    normalerweise kürzer, siehe --max-utterance).
+    """
+
+    audio = np.ascontiguousarray(audio, dtype=np.float32)
+
+    step = int(WHISTLE_MAX_S * SR)
+
+    texts = []
+
+    for i in range(0, len(audio), step):
+
+        piece = audio[i:i + step]
+
+        if len(piece) < int(0.2 * SR):
+            continue
+
+        result = model.transcribe(
+            piece,
+            language=whistle_language(args),
+            keywords=whistle_keywords(args),
+        )
+
+        text = str(result.get("text", "")).strip()
+
+        if text:
+            texts.append(text)
+
+    return " ".join(texts).strip()
 
 
 # ============================================================================
@@ -664,6 +790,147 @@ def load_audio_16k(path):
 
     return (
         np.concatenate(chunks).astype(np.float32) / 32768.0
+    )
+
+
+def split_audio_vad(audio, args, max_len=WHISTLE_MAX_S):
+    """
+    Offline-Segmentierung für Dateien (ohne Zusatzpakete):
+    Energie-VAD je 30-ms-Frame mit dateiweitem Rauschteppich.
+
+    Liefert [(start_s, end_s, audio_stueck), ...], jedes Stück
+    höchstens max_len Sekunden. Zu lange Sprachabschnitte werden
+    an der leisesten Stelle im letzten Fenster (6 s) geschnitten.
+    """
+
+    n = len(audio) // FRAME
+
+    if n == 0:
+        return []
+
+    frames = audio[: n * FRAME].reshape(n, FRAME)
+
+    db = 20 * np.log10(
+        np.sqrt((frames * frames).mean(axis=1)) + 1e-9
+    )
+
+    # Rauschteppich = sehr niedriges Perzentil. Die Schwelle wird nach
+    # oben gedeckelt (abs. Schwelle + 13 dB, Standard: -35 dBFS), damit
+    # sprachdichte Dateien mit kaum Pausen nicht komplett "stumm"
+    # erscheinen.
+    noise = float(np.percentile(db, 5))
+    thr = max(
+        args.threshold_db,
+        min(noise + args.margin_db, args.threshold_db + 13.0),
+    )
+
+    idx = np.flatnonzero(db > thr)
+
+    if len(idx) == 0:
+        return []
+
+    gap = max(1, int(round(args.silence / FRAME_S)))
+
+    # Sprachframes mit Lücken < silence zu Abschnitten verbinden
+    spans = []
+    start = prev = int(idx[0])
+
+    for k in idx[1:]:
+        k = int(k)
+        if k - prev > gap:
+            spans.append((start, prev + 1))
+            start = k
+        prev = k
+
+    spans.append((start, prev + 1))
+
+    pad = int(0.2 / FRAME_S)
+    maxf = int(max_len / FRAME_S)
+    win = int(6.0 / FRAME_S)
+
+    chunks = []
+
+    for s0, e0 in spans:
+
+        if (e0 - s0) * FRAME_S < args.min_speech:
+            continue
+
+        s0 = max(0, s0 - pad)
+        e0 = min(n, e0 + pad)
+
+        while e0 - s0 > maxf:
+            lo = s0 + maxf - win
+            cut = lo + int(np.argmin(db[lo: s0 + maxf]))
+            chunks.append((s0, cut))
+            s0 = cut
+
+        chunks.append((s0, e0))
+
+    return [
+        (
+            s0 * FRAME_S,
+            e0 * FRAME_S,
+            audio[s0 * FRAME: e0 * FRAME],
+        )
+        for s0, e0 in chunks
+    ]
+
+
+def transcribe_file_whistle(
+    model,
+    filename,
+    args,
+    outfile,
+):
+    """
+    Whistle verarbeitet max. 30 s je Aufruf und hat keine eigene VAD.
+    Deshalb: Datei dekodieren -> Energie-VAD-Abschnitte -> je Abschnitt
+    ein Aufruf.
+    """
+
+    print(
+        "\nTranskribiere Datei mit Cactus Whistle:"
+    )
+
+    print(f"  {filename}\n")
+
+    start_time = time.monotonic()
+
+    print("Dekodiere Audio ...")
+    audio = load_audio_16k(filename)
+    print(f"  Dauer: {duration_ts(len(audio) / SR)}\n")
+
+    chunks = split_audio_vad(audio, args)
+
+    print(f"{len(chunks)} Sprachabschnitte gefunden.\n")
+
+    count = 0
+
+    for begin, end, piece in chunks:
+
+        text = transcribe_whistle_audio(
+            model,
+            piece,
+            args,
+        )
+
+        if not text or contains_hallucination(text):
+            continue
+
+        write_line(
+            outfile,
+            f"[{duration_ts(begin)} - "
+            f"{duration_ts(end)}] {text}",
+        )
+
+        count += 1
+
+    elapsed = time.monotonic() - start_time
+
+    print(
+        f"\nWhistle fertig. Segmente: {count}. "
+        f"Rechenzeit: {elapsed:.1f} s "
+        f"({len(audio) / SR / max(elapsed, 0.001):.1f}x Echtzeit)."
     )
 
 
@@ -904,6 +1171,14 @@ def transcribe_file(
             outfile,
         )
 
+    elif engine == "whistle":
+        transcribe_file_whistle(
+            model,
+            filename,
+            args,
+            outfile,
+        )
+
     else:
         raise RuntimeError(
             f"Unbekannte ASR-Engine: {engine}"
@@ -1057,6 +1332,20 @@ def live_mode(
                 )
 
             # -------------------------------------------------------
+            # Whistle
+            # -------------------------------------------------------
+
+            elif engine == "whistle":
+
+                text = (
+                    transcribe_whistle_audio(
+                        model,
+                        audio,
+                        args,
+                    )
+                )
+
+            # -------------------------------------------------------
             # Parakeet
             # -------------------------------------------------------
 
@@ -1161,7 +1450,7 @@ def main():
             "Whisper-Modell: "
             "tiny|base|small|medium|"
             "large-v3-turbo|large-v3 "
-            "oder 'parakeet' "
+            "oder 'parakeet' oder 'whistle' "
             "(Standard: large-v3-turbo)"
         ),
     )
@@ -1180,6 +1469,15 @@ def main():
             "Whisper Beam-Size "
             "(1 = schnell, höhere Werte "
             "= potentiell genauer)"
+        ),
+    )
+
+    ap.add_argument(
+        "--keywords",
+        metavar="WORT1,WORT2",
+        help=(
+            "Nur Whistle: kommagetrennte Namen/Fachbegriffe, "
+            "auf die die Erkennung hin ausgerichtet wird"
         ),
     )
 
@@ -1369,6 +1667,12 @@ def main():
         print(
             f"Whisper-Modell: "
             f"{args.model}"
+        )
+
+    elif engine == "whistle":
+        print(
+            "Cactus Whistle: CPU "
+            "(Telemetrie deaktiviert)"
         )
 
     else:

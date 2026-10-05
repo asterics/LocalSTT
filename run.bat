@@ -30,7 +30,7 @@ if not exist "%MARKER%" (
     echo [2/2] Installing dependencies - this happens only once ...
     "%VPY%" -m pip install --upgrade pip
     if errorlevel 1 goto :fail
-    "%VPY%" -m pip install faster-whisper PyAudioWPatch soxr numpy "av<19" onnx-asr[cpu,hub]
+    "%VPY%" -m pip install faster-whisper PyAudioWPatch soxr numpy "av<19" onnx-asr[cpu,hub] cactus-needle
     if errorlevel 1 goto :fail
     echo installed> "%MARKER%"
 )
